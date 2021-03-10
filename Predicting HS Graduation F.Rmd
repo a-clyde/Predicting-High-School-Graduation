@@ -1,0 +1,353 @@
+---
+title: "Predicting HS Graduation"
+author: "Andrew Clyde & Asher Paules-Bronet"
+date: "03/10/2021"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Load Packages 
+```{r}
+library(pacman)
+p_load(tidyverse, modeldata, skimr, janitor,
+       kknn, tidymodels, magrittr, AER, tune, glmnet,
+       ranger, mlbench, parallel, data.table, xgboost, 
+       rlang, dplyr, kernlab, caret, leaps, rpart.plot)
+```
+
+
+```{r}
+# Load in data, rename random x1 variable as ID and clean names
+star_df = read_csv("STAR_Students.csv") %>% rename(id = X1)
+star_df %<>% clean_names() 
+
+# Generate new column equal to zero labeled missing
+star_df <- star_df %>% mutate(missing = 0)
+
+# Reference the hsgrdcol column against the missing column to generate missing observations
+star_df$missing[is.na(star_df$hsgrdcol)]<-"missing"
+
+# Filter out missing data entirely from data set 
+star_df %<>% filter(missing==0)
+
+# Create a dummy variable for 'good' credit status
+star_df %<>% mutate(graduated = 1 * (hsgrdcol == "YES")) %>% select(-hsgrdadd, -hsgrdcol)
+
+#setting seed for split
+set.seed(8620985)
+
+# Create training and test set with 80/20 split for out of sample prediction accuracy
+df_split <- star_df %>% initial_split(prop = 0.8)
+
+# Grab the training subset
+df_train = df_split %>% training()
+
+# Grab the testing subset
+df_test = df_split %>% testing()
+```
+
+```{r}
+# Define the recipe on the whole data set
+star_recipe =  recipe(graduated ~ ., data = star_df) %>%
+    # Remove variables with one level, are recursive and were created 
+    step_rm(contains("gktgen")) %>%
+    step_rm(contains("hsgradadd")) %>%
+    step_rm(contains("flaghsgraduate")) %>%
+    step_rm(contains("missing")) %>%
+    step_rm(contains("hsgrdcol")) %>%
+    # Update the role of 'Id'
+    update_role("id", new_role = "id variable") %>%
+    # Mean imputation for numeric predictors
+    step_meanimpute(all_predictors() & all_numeric()) %>% 
+    # Mode imputation for categorical predictors
+    step_modeimpute(all_predictors() & all_nominal()) %>%  
+    # Create dummies for categorical variables
+    step_dummy(all_predictors() & all_nominal()) %>%
+    # Recognize new levels when folding training set for cross validation
+    step_naomit(all_predictors(), skip = TRUE) %>%
+    # Standardize
+    step_normalize(all_predictors() & all_numeric()) %>%
+    # Remove low-variance, highly correlated, or linearly dependent predictors
+    step_nzv(all_predictors()) %>% 
+    step_corr(all_predictors()) %>% 
+    step_lincomb(all_predictors()) 
+```
+ 
+# Lasso 
+```{r}
+# Define the lasso regression model (with 'glmnet' engine)
+lasso = linear_reg(penalty = tune(), mixture = 1) %>%
+    set_mode("regression") %>% set_engine("glmnet", standardize = F)
+
+# Define the 10-fold cross-validation splits on training set
+set.seed(8701)
+lasso_cv = df_train %>% vfold_cv(v = 10)
+
+# Define the workflow
+lasso_workflow = workflow() %>% add_model(lasso) %>%
+  add_recipe(star_recipe) 
+
+# Tune the lasso penalty
+lasso_tune = 
+    lasso_workflow %>% tune_grid(lasso_cv,
+    grid = data.frame(penalty = c(10^seq(10, -10, 
+    length.out = 50), 0)), metrics = metric_set(rmse))
+
+##showing best training model
+lasso_tune %>% show_best
+
+# Finalize the model with the best model
+lasso_final = lasso_workflow %>%
+    finalize_workflow(select_best(lasso_tune, metric = "rmse"))
+
+# Fit the final model on the test data set
+lasso_final_fit = lasso_final %>% fit(df_test)
+
+# Write over 'lasso_final_fit' with this last_fit() approach
+lasso_final_fit = lasso_final %>% last_fit(df_split)
+
+# Collect metrics on the test data!
+lasso_final_fit %>% collect_metrics()
+```
+
+```{r}
+##Now we need to add the predictions
+lasso_predictions = lasso_final_fit %>% collect_predictions()
+```
+
+```{r}
+#creating lasso dataframe with prediction and actual result
+
+lasso_data = data.frame(Id = df_test$id, graduated = df_test$graduated,
+                        lasso_pred = lasso_predictions$.pred)
+
+lasso_data$lasso_y_hat = as.numeric(lasso_data$lasso_pred >= 0.5)
+```
+
+```{r}
+##creating confusion matrix
+cm_lasso = conf_mat(data = tibble(y_hat = lasso_data$lasso_y_hat %>% as.factor(),
+                                  y = lasso_data$graduated %>% as.factor()),
+                    truth = y, estimate = y_hat)
+
+cm_lasso
+```
+
+# Elasticnet 
+```{r}
+# Define the elasticnet regression model (with 'glmnet' engine)
+star_elasticnet =
+    linear_reg(penalty = tune(), mixture = tune()) %>%
+    set_mode("regression") %>%
+    set_engine("glmnet")
+
+# Define the workflow
+elasticnet_workflow = workflow() %>% add_model(star_elasticnet) %>%
+    add_recipe(star_recipe)
+
+# Define the 10-fold cross-validation splits on training set
+set.seed(1920)
+elasticnet_cv = df_train %>% vfold_cv(v = 10)
+
+# Tune the elasticnet penalty
+elasticnet_tune = elasticnet_workflow %>% tune_grid(
+    elasticnet_cv, grid = grid_regular(mixture(), 
+    penalty(), levels = 10:10), metrics = metric_set(rmse))
+
+#showing best results in training model
+elasticnet_tune %>% show_best()
+
+# Finalize the model with the best model
+elasticnet_final = elasticnet_workflow %>%
+    finalize_workflow(select_best(elasticnet_tune, metric = "rmse"))
+
+# Fit the final model on the test data set
+elasticnet_final_fit = elasticnet_final %>% fit(df_test)
+
+# Write over 'elasticnet final fit' with this last_fit() approach
+elasticnet_final_fit = elasticnet_final %>% last_fit(df_split)
+
+# Collect metrics on the test data!
+elasticnet_final_fit %>% collect_metrics()
+```
+
+```{r}
+##Now we need to add the predictions
+elasticnet_predictions = elasticnet_final_fit %>% collect_predictions()
+```
+
+```{r}
+#creating elasticnet dataframe with prediction and actual result
+
+elasticnet_data = data.frame(Id = df_test$id, 
+    graduated = df_test$graduated,
+    elasticnet_pred = elasticnet_predictions$.pred)
+
+elasticnet_data$elasticnet_y_hat = 
+  as.numeric(elasticnet_data$elasticnet_pred >= 0.5)
+```
+
+```{r}
+##creating confusion matrix
+cm_elasticnet = conf_mat(data = tibble(y_hat = 
+    elasticnet_data$elasticnet_y_hat %>% as.factor(),
+    y = elasticnet_data$graduated %>% as.factor()),
+    truth = y, estimate = y_hat)
+
+cm_elasticnet
+```
+
+# Recipe for classification models 
+```{r}
+# Define the recipe on the whole data set with graduated as a factor
+tree_recipe =  recipe(graduated ~ ., data = star_df) %>%
+    # Remove variables with one level, are recursive and were created 
+    step_rm(contains("gktgen")) %>%
+    step_rm(contains("hsgradadd")) %>%
+    step_rm(contains("flaghsgraduate")) %>%
+    step_rm(contains("missing")) %>%
+    step_rm(contains("hsgrdcol")) %>%
+    # Update the role of 'Id'
+    update_role("id", new_role = "id variable") %>%
+    # Mean imputation for numeric predictors
+    step_meanimpute(all_predictors() & all_numeric()) %>% 
+    # Mode imputation for categorical predictors
+    step_modeimpute(all_predictors() & all_nominal()) %>%  
+    # Create dummies for categorical variables
+    step_dummy(all_predictors() & all_nominal()) %>%
+    # Recognize new levels when folding training set for cross validation
+    step_naomit(all_predictors(), skip = TRUE) %>%
+    # Standardize
+    step_normalize(all_predictors() & all_numeric()) %>%
+    # Remove low-variance, highly correlated, or linearly dependent predictors
+    step_nzv(all_predictors()) %>% 
+    step_corr(all_predictors()) %>% 
+    step_lincomb(all_predictors()) %>% step_mutate(graduated = as.factor(graduated))
+```
+
+# Support Vector Machine
+```{r}
+# Define the 10-fold cross-validation splits on training set
+set.seed(1031963)
+svm_cv = df_train %>% vfold_cv(v = 5)
+
+# The Polynomial-SVM model
+star_svm = svm_poly(mode = "classification", cost = tune(), 
+  degree = tune()) %>% set_engine("kernlab")
+
+# The linear-SVM workflow
+wf_svm = workflow() %>% add_model(star_svm) %>% 
+  add_recipe(tree_recipe)
+
+# Tune the linear SVM
+tune_svm = tune_grid(wf_svm, svm_cv,
+  grid = expand_grid(cost = 10^seq(-4, 2, length = 10),
+  degree = 1:3), metrics = metric_set(f_meas, accuracy))
+
+#showing best results in training model
+tune_svm %>% show_best("accuracy")
+tune_svm %>% show_best("f_meas")
+
+# Finalize the model with the best model
+svm_final = wf_svm %>%
+    finalize_workflow(select_best(tune_svm, 
+    metric = "accuracy", "f_meas"))
+
+# Fit the final model on the test data set
+svm_final_fit = svm_final %>% fit(df_test)
+
+# Write over 'svm final fit' with this last_fit() approach
+svm_final_fit = svm_final %>% last_fit(df_split)
+
+# Collect metrics on the test data!
+svm_final_fit %>% collect_metrics()
+```
+
+```{r}
+##Now we need to add the predictions
+svm_predictions = svm_final_fit %>% collect_predictions()
+```
+
+
+```{r}
+##creating confusion matrix
+cm_svm = conf_mat(data = tibble(y_hat = 
+    svm_predictions$.pred_class %>% as.factor(),
+    y = svm_predictions$graduated %>% as.factor()),
+    truth = y, estimate = y_hat)
+
+cm_svm
+```
+
+
+# Decision Tree 
+```{r}
+#defining cv split
+set.seed(6974898)
+tree_cv = df_train %>% vfold_cv(v = 5)
+
+#defining decision tree model
+star_tree = decision_tree(mode = "classification",
+      cost_complexity = tune(),
+      tree_depth = tune(),
+      min_n = 10) %>% set_engine("rpart")
+
+#defining workflow
+tree_flow = workflow() %>% add_model(star_tree) %>% add_recipe(tree_recipe)
+
+#Tune
+tune_tree = tree_flow %>% tune_grid(
+  tree_cv, grid = expand_grid(
+    cost_complexity = seq(0, 0.15, by = 0.01),
+    tree_depth = c(1,2,5,10)),
+  metrics = metric_set(accuracy, roc_auc))
+
+#showing best results in training model
+tune_tree %>% show_best("accuracy")
+tune_tree %>% show_best("roc_auc")
+
+# Finalize the model with the best model
+tree_final = tree_flow %>%
+    finalize_workflow(select_best(tune_tree, 
+    metric = "accuracy", "roc_auc"))
+
+# Fit the final model on the test data set
+tree_final_fit = tree_final %>% fit(df_test)
+
+#extract fitted model(code not working)
+best_tree = tree_final_fit %>% pull_workflow_fit()
+
+#plot
+
+best_tree$fit %>% rpart.plot(roundint = F)
+
+```
+flaghs_courses if has 2 yrs of data on hs classes
+
+
+```{r}
+# Write over 'tree final fit' with this last_fit() approach
+tree_final_fit = tree_final %>% last_fit(df_split)
+
+# Collect metrics on the test data!
+tree_final_fit %>% collect_metrics()
+```
+
+```{r}
+##Now we need to add the predictions
+tree_predictions = tree_final_fit %>% collect_predictions()
+```
+
+```{r}
+##creating confusion matrix
+cm_tree = conf_mat(data = tibble(y_hat = 
+    tree_predictions$.pred_class %>% as.factor(),
+    y = tree_predictions$graduated %>% as.factor()),
+    truth = y, estimate = y_hat)
+
+cm_tree
+```
+
